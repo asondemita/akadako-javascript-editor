@@ -258,7 +258,7 @@ function stopCode() {
   pageRunning = false;
   stopBtn.disabled = true;
   setMonitorPaused(false);
-  showView("edit");
+  // Pageモードのまま停止する（自動でEditへは切り替えない）
   log("◼ 停止しました\n", "muted");
 }
 
@@ -823,7 +823,7 @@ function applyVibeResult(code) {
     cm.setValue(code);
     editorPristine = true;   // 生成直後は未編集あつかい
     currentName = "";
-    showView("edit");
+    // 表示中のビュー（Edit/Page）はそのまま維持する（自動でEditへは切り替えない）
     setStatus("バイブコーディングでコードを生成しました —「Run ▶」で表示できます", true);
     log("バイブコーディングでコードを生成しました。\n", "muted");
   };
