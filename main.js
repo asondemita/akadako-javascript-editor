@@ -234,11 +234,23 @@ function injectConsoleBridge(html) {
   return CONSOLE_BRIDGE + html;
 }
 
+// 実行中ページのエラーを集めておく（バイブコーディングの修正で LLM に渡す）。
+let pageErrors = [];
+const MAX_PAGE_ERRORS = 10;
+function recordPageError(text) {
+  if (!text) return;
+  // interval で同じエラーが連発するので、直近と同一なら記録しない
+  if (pageErrors[pageErrors.length - 1] === text) return;
+  pageErrors.push(text);
+  if (pageErrors.length > MAX_PAGE_ERRORS) pageErrors.shift();
+}
+
 window.addEventListener("message", (e) => {
   const m = e.data;
   if (!m || !m.__adkConsole) return;
   const cls = m.kind === "error" || m.kind === "warn" ? "err" : undefined;
   log("[ページ] " + m.text + "\n", cls);
+  if (m.kind === "error") recordPageError(m.text);
 });
 
 let pageRunning = false;
@@ -246,6 +258,7 @@ let pageRunning = false;
 function runCode() {
   // ページ側がボードを使うので、エディタのモニターは一時停止する
   setMonitorPaused(true);
+  pageErrors = [];   // 新しい実行のエラーだけを集める
   preview.srcdoc = injectConsoleBridge(cm.getValue());
   pageRunning = true;
   stopBtn.disabled = false;
@@ -687,7 +700,8 @@ let lastVibePrompt = "";
 
 // 生成AIに渡す指示文。ユーザーの要望を「1つの完結したHTMLページ」に仕立てさせる。
 // currentCode を渡すと「今のコードを修正」、null なら「ゼロから作成」のプロンプトになる。
-function buildVibePrompt(userRequest, currentCode) {
+// errors（実行時エラーの配列）があれば、修正時にその情報も渡す。
+function buildVibePrompt(userRequest, currentCode, errors) {
   const api = (window.AKADAKO_BOARD_API || [])
     .map((a) => "  board." + a.sig + " — " + a.doc)
     .join("\n");
@@ -718,6 +732,16 @@ function buildVibePrompt(userRequest, currentCode) {
   ];
   if (currentCode) {
     lines.push("", "# 現在のHTMLコード", "```html", currentCode, "```");
+  }
+  if (currentCode && errors && errors.length) {
+    // エラー文が長くなりすぎないよう軽く切り詰める（入力長制限の対策）
+    const trimmed = errors.slice(-MAX_PAGE_ERRORS).map((e) => e.slice(0, 300));
+    lines.push(
+      "",
+      "# 実行時に出ているエラー",
+      ...trimmed,
+      "上記のエラーも解消するように修正してください。"
+    );
   }
   lines.push("", "# ユーザーの要望", userRequest);
   return lines.join("\n");
@@ -781,7 +805,10 @@ function openVibeDialog(prefill) {
     if (mode === "modify") {
       label.textContent = "今のコードをどう直したいか、日本語で説明してください:";
       ta.placeholder = "例: 明るさセンサーの値も大きな文字で表示して";
-      hint.textContent = "エディタの現在のコードを送り、要望に沿って修正します。コードが大きいと送信できないことがあります。Ctrl/⌘+Enter でも実行できます。";
+      hint.textContent =
+        "エディタの現在のコードを送り、要望に沿って修正します。" +
+        (pageErrors.length ? "実行時に出ているエラーも一緒に送ります。" : "") +
+        "コードが大きいと送信できないことがあります。Ctrl/⌘+Enter でも実行できます。";
     } else {
       label.textContent = "作りたいものを日本語で説明してください:";
       ta.placeholder = "例: 距離センサーの値が近いほど画面が赤くなるページ";
@@ -812,6 +839,7 @@ function openVibeDialog(prefill) {
 
 async function runVibeGeneration(promptText, mode) {
   const currentCode = mode === "modify" ? cm.getValue() : null;
+  const errors = mode === "modify" ? pageErrors.slice() : [];   // 実行時エラーのスナップショット
   const node = document.createElement("div");
   node.style.cssText = "display:flex;align-items:center;gap:.7rem;";
   const spin = document.createElement("span");
@@ -822,7 +850,7 @@ async function runVibeGeneration(promptText, mode) {
   showModal("バイブコーディング ✨", node, []); // 生成中はボタンなし
 
   try {
-    const data = await callGenerativeAI(buildVibePrompt(promptText, currentCode));
+    const data = await callGenerativeAI(buildVibePrompt(promptText, currentCode, errors));
     if (data && typeof data.content === "string" && data.content.trim() !== "") {
       const code = extractCode(data.content);
       closeModal();
