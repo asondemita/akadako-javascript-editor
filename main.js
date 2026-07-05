@@ -868,9 +868,9 @@ function applyVibeResult(code, mode) {
     cm.setValue(code);
     editorPristine = true;   // 生成直後は未編集あつかい
     currentName = "";
-    // 表示中のビュー（Edit/Page）はそのまま維持する（自動でEditへは切り替えない）
-    setStatus("バイブコーディングでコードを生成しました —「Run ▶」で表示できます", true);
+    setStatus("バイブコーディングでコードを生成しました", true);
     log("バイブコーディングでコードを生成しました。\n", "muted");
+    runCode();               // 生成が完成したら自動で実行し、Pageモードに切り替える
   };
   if (mode === "new" && !editorPristine) {
     const msg = document.createElement("div");
