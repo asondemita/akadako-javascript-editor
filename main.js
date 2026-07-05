@@ -677,14 +677,169 @@ function confirmDelete(name) {
 $("save").addEventListener("click", openSaveDialog);
 $("open").addEventListener("click", openOpenDialog);
 
-// --- バイブコーディング（準備中） -------------------------------------------------
-$("vibe").addEventListener("click", () => {
-  const msg = document.createElement("div");
-  msg.textContent = "準備中です。今後のアップデートをお楽しみに！";
-  showModal("バイブコーディング ✨", msg, [
-    { label: "閉じる", primary: true, onClick: closeModal },
+// --- バイブコーディング（生成AIでHTMLページを作る） ---------------------------------
+// xcx-g2s の「生成AI」ブロックと同じエンドポイントを使う。
+// 認証は 699.jp のアクセスコード Cookie（credentials: include で送信）。
+// js.699.jp と xcratch.699.jp は同一サイトなのでサードパーティ Cookie の制約を受けない。
+const GENERATIVE_AI_URL = "https://xcratch.699.jp/agai/ai";
+
+let lastVibePrompt = "";
+
+// 生成AIに渡す指示文。ユーザーの要望を「1つの完結したHTMLページ」に仕立てさせる。
+function buildVibePrompt(userRequest) {
+  const api = (window.AKADAKO_BOARD_API || [])
+    .map((a) => "  board." + a.sig + " — " + a.doc)
+    .join("\n");
+  return [
+    "あなたは AkaDako JavaScript Editor のためのコード生成アシスタントです。",
+    "ユーザーの要望に合う「1つの完結したHTMLページ」を作成してください。",
+    "",
+    "# 制約",
+    "- HTML・CSS・JavaScript をすべて1つのHTMLファイルにまとめる。",
+    "- AkaDako（センサーやLED等）を使う場合は <script src=\"akadako.js\"></script> を読み込み、",
+    "  `const board = await AkaDako.connect();` で接続してから使う。",
+    "- fetch〜 と run〜 のメソッドは await を付けて async 関数の中で呼ぶ。",
+    "- 画面は日本語で、初学者にも分かりやすい簡潔なものにする。",
+    "- 出力は完成したHTMLコードのみ。説明文やマークダウンのコードフェンス(```)は付けない。",
+    "",
+    "# 使える主なAPI（AkaDako.connect() が返す board のメソッド）",
+    api,
+    "AkaDako.Color.Red などの色定数、AkaDako.ColorLed.OnBoard などの接続先定数も使える。",
+    "",
+    "# ユーザーの要望",
+    userRequest,
+  ].join("\n");
+}
+
+// 応答テキストからコード本体を取り出す（マークダウンのコードフェンスがあれば剥がす）。
+function extractCode(text) {
+  if (!text) return "";
+  const fence = text.match(/```(?:html)?\s*([\s\S]*?)```/i);
+  return (fence ? fence[1] : text).trim();
+}
+
+async function callGenerativeAI(promptText) {
+  // ボード接続中ならその版を、未接続なら既定値を送る（エンドポイントは board.version を要求する）
+  let version = "2.0.0";
+  try {
+    if (board && board.isConnected) version = await board.fetchVersion();
+  } catch (e) { /* 取得できなければ既定値のまま */ }
+
+  const res = await fetch(GENERATIVE_AI_URL, {
+    mode: "cors",
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      content: [{ text: promptText }],
+      board: { version },
+      locale: "ja",
+    }),
+  });
+  return res.json(); // { content: string|null, error?: string|object }
+}
+
+function openVibeDialog() {
+  const wrap = document.createElement("div");
+  const label = document.createElement("div");
+  label.textContent = "作りたいものを日本語で説明してください:";
+  label.style.marginBottom = ".4rem";
+  const ta = document.createElement("textarea");
+  ta.rows = 5;
+  ta.value = lastVibePrompt;
+  ta.placeholder = "例: 距離センサーの値が近いほど画面が赤くなるページ";
+  const hint = document.createElement("div");
+  hint.style.cssText = "font-size:.85rem;color:var(--muted);margin-top:.5rem;line-height:1.6;";
+  hint.textContent = "AkaDako の生成AI がHTMLページを作成します（ご利用には 699.jp のアクセスコードが必要です）。Ctrl/⌘+Enter でも生成できます。";
+  wrap.append(label, ta, hint);
+
+  const doGen = () => {
+    const p = ta.value.trim();
+    if (!p) { ta.focus(); return; }
+    lastVibePrompt = p;
+    runVibeGeneration(p);
+  };
+  ta.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); doGen(); }
+  });
+  showModal("バイブコーディング ✨", wrap, [
+    { label: "生成 ✨", primary: true, onClick: doGen },
+    { label: "キャンセル", onClick: closeModal },
   ]);
-});
+  setTimeout(() => ta.focus(), 0);
+}
+
+async function runVibeGeneration(promptText) {
+  const node = document.createElement("div");
+  node.style.cssText = "display:flex;align-items:center;gap:.7rem;";
+  const spin = document.createElement("span");
+  spin.className = "vibe-spinner";
+  const txt = document.createElement("span");
+  txt.textContent = "生成中です…（10〜30秒ほどかかります）";
+  node.append(spin, txt);
+  showModal("バイブコーディング ✨", node, []); // 生成中はボタンなし
+
+  try {
+    const data = await callGenerativeAI(buildVibePrompt(promptText));
+    if (data && typeof data.content === "string" && data.content.trim() !== "") {
+      const code = extractCode(data.content);
+      closeModal();
+      applyVibeResult(code);
+      return;
+    }
+    // エラー処理（xcx-g2s の生成AIブロックと同じ分岐）
+    let errHtml = null, errText = null;
+    if (data && data.error) {
+      if (typeof data.error === "string") {
+        errText = data.error;
+      } else if (typeof data.error === "object") {
+        if (data.error.type === "text/html") errHtml = data.error.content;
+        else if (typeof data.error.content === "string") errText = data.error.content;
+      }
+    }
+    if (!errHtml && !errText) {
+      errText = "空の応答が返りました。要望を具体的にして、もう一度お試しください。";
+    }
+    showVibeError(errHtml, errText);
+  } catch (e) {
+    showVibeError(null, "生成AIに接続できませんでした: " + ((e && e.message) || e));
+  }
+}
+
+function showVibeError(html, text) {
+  const node = document.createElement("div");
+  node.className = "vibe-errbox";
+  if (html) node.innerHTML = html;          // 699.jp のエラー（アクセスコード案内リンク等）
+  else node.textContent = text || "生成に失敗しました。";
+  showModal("バイブコーディング ✨", node, [
+    { label: "入力に戻る", primary: true, onClick: openVibeDialog },
+    { label: "閉じる", onClick: closeModal },
+  ]);
+}
+
+// 生成結果をエディタへ。未保存の編集があるときは置き換え確認する（サンプルと同じ作法）。
+function applyVibeResult(code) {
+  const put = () => {
+    cm.setValue(code);
+    editorPristine = true;   // 生成直後は未編集あつかい
+    currentName = "";
+    showView("edit");
+    setStatus("バイブコーディングでコードを生成しました —「Run ▶」で表示できます", true);
+    log("バイブコーディングでコードを生成しました。\n", "muted");
+  };
+  if (!editorPristine) {
+    const msg = document.createElement("div");
+    msg.textContent = "生成したコードで今の内容を置き換えます。よろしいですか？（保存していない変更は消えます）";
+    showModal("確認", msg, [
+      { label: "置き換える", primary: true, onClick: () => { closeModal(); put(); } },
+      { label: "やめる", onClick: closeModal },
+    ]);
+    return;
+  }
+  put();
+}
+
+$("vibe").addEventListener("click", openVibeDialog);
 
 // --- 右パネルのタブ（センサー / リファレンス） -------------------------------------
 const refview = $("refview");

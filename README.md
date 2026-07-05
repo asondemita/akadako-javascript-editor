@@ -34,7 +34,11 @@ python3 serve.py     # http://localhost:8771/ を Chrome / Edge で開く
   「リファレンス」タブ = akadako.js の JavaScript リファレンス
 - **Save / Open**: ブラウザの localStorage に保存。編集中の内容は
   自動でドラフト保存され、再訪問時に復元できます。
-- **Vibe Coding ✨**: バイブコーディング（準備中。今後 AI によるコード生成を予定）
+- **Vibe Coding ✨**: 作りたいものを日本語で入力すると、AkaDako の生成AI
+  （xcx-g2s の「生成AI」ブロックと同じ `xcratch.699.jp/agai/ai`）が HTML ページを
+  生成してエディタに反映します。ご利用には 699.jp のアクセスコードが必要です
+  （認証は `*.699.jp` の Cookie。本番は `js.699.jp` のように 699.jp 配下で配信すると
+  同一サイト扱いになり確実に動きます）。
 
 ## 実行のしくみ
 
