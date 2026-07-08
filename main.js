@@ -237,12 +237,16 @@ function injectConsoleBridge(html) {
 // 実行中ページのエラーを集めておく（バイブコーディングの修正で LLM に渡す）。
 let pageErrors = [];
 const MAX_PAGE_ERRORS = 10;
+let pageOutput = "";      // 実行中ページの console 出力（相談モードでAIに渡す実行時コンテキスト）
+let askAiOffered = false; // 「AIに聞く」導線を今の実行でもう出したか
 function recordPageError(text) {
   if (!text) return;
   // interval で同じエラーが連発するので、直近と同一なら記録しない
   if (pageErrors[pageErrors.length - 1] === text) return;
   pageErrors.push(text);
   if (pageErrors.length > MAX_PAGE_ERRORS) pageErrors.shift();
+  // 最初のエラーの直後に一度だけ「AIに聞く」導線を出す
+  if (!askAiOffered) { askAiOffered = true; offerErrorConsult(); }
 }
 
 window.addEventListener("message", (e) => {
@@ -251,6 +255,7 @@ window.addEventListener("message", (e) => {
   const cls = m.kind === "error" || m.kind === "warn" ? "err" : undefined;
   log("[ページ] " + m.text + "\n", cls);
   if (m.kind === "error") recordPageError(m.text);
+  else if (pageRunning) pageOutput = (pageOutput + m.text + "\n").slice(-3000);
 });
 
 let pageRunning = false;
@@ -259,6 +264,8 @@ function runCode() {
   // ページ側がボードを使うので、エディタのモニターは一時停止する
   setMonitorPaused(true);
   pageErrors = [];   // 新しい実行のエラーだけを集める
+  pageOutput = "";
+  askAiOffered = false;
   preview.srcdoc = injectConsoleBridge(cm.getValue());
   pageRunning = true;
   stopBtn.disabled = false;
@@ -696,15 +703,21 @@ $("open").addEventListener("click", openOpenDialog);
 // js.699.jp と xcratch.699.jp は同一サイトなのでサードパーティ Cookie の制約を受けない。
 const GENERATIVE_AI_URL = "https://xcratch.699.jp/agai/ai";
 
+const VIBE_TITLE = "Vibe Coding & Assist";
 let lastVibePrompt = "";
+let consultHistory = [];   // 相談モードの直近のやりとり（「続けて質問」で文脈を引き継ぐ）
+
+function boardApiLines() {
+  return (window.AKADAKO_BOARD_API || [])
+    .map((a) => "  board." + a.sig + " — " + a.doc)
+    .join("\n");
+}
 
 // 生成AIに渡す指示文。ユーザーの要望を「1つの完結したHTMLページ」に仕立てさせる。
 // currentCode を渡すと「今のコードを修正」、null なら「ゼロから作成」のプロンプトになる。
 // errors（実行時エラーの配列）があれば、修正時にその情報も渡す。
 function buildVibePrompt(userRequest, currentCode, errors) {
-  const api = (window.AKADAKO_BOARD_API || [])
-    .map((a) => "  board." + a.sig + " — " + a.doc)
-    .join("\n");
+  const api = boardApiLines();
   const head = currentCode
     ? [
         "あなたは AkaDako JavaScript Editor のためのコード生成アシスタントです。",
@@ -747,6 +760,79 @@ function buildVibePrompt(userRequest, currentCode, errors) {
   return lines.join("\n");
 }
 
+// 相談モードでAIに渡す実行時コンテキスト。コードを読むだけでは分からない
+// 「実際に何が起きていたか」（接続センサー・計測値・ページのconsole出力）を添える。
+function buildRuntimeContext() {
+  const parts = [];
+  if (board) {
+    const labels = availableKeys.map((k) => defByKey.get(k).label);
+    parts.push("接続中のセンサー: " + (labels.join(", ") || "なし"));
+  } else {
+    parts.push("エディタはボード未接続（ページ側で接続している可能性はある）");
+  }
+  if (watches.size) {
+    const lines = [...watches.entries()].map(([key, w]) => {
+      const def = defByKey.get(key);
+      const name = def ? def.label + (def.unit ? " (" + def.unit + ")" : "") : key;
+      let s = "- " + name + ": 現在値 " + w.valEl.textContent;
+      const vs = w.values.slice(-20);
+      if (vs.length >= 2) {
+        s += "（直近" + vs.length + "回の最小 " + fmtVal(Math.min(...vs)) + " / 最大 " + fmtVal(Math.max(...vs)) + "）";
+      }
+      return s;
+    });
+    parts.push("センサーモニターの計測値:\n" + lines.join("\n"));
+  }
+  if (pageOutput.trim()) {
+    parts.push("実行中ページの console 出力:\n```\n" + pageOutput.trim() + "\n```");
+  }
+  return parts.join("\n");
+}
+
+// 相談モード（エラー原因・コードについて）の指示文。コードは書き換えず、
+// 初学者が自分で直せるように説明とヒントを返させる。
+function buildConsultPrompt(question, mode) {
+  const lines = [
+    "あなたは AkaDako JavaScript Editor で小中学生にプログラミングを教える、やさしい先生です。",
+    "下記のHTMLページのコードについての質問に、日本語で答えてください。",
+    "",
+    "# 答え方のルール",
+    "- 「なにが起きているか」→「どうしてか」→「どうすればよいかのヒント」の順で、400字以内で簡潔に。",
+    "- 完成したコードは書かない。示してよいのは1〜2行の断片まで。答えを教えるのではなく、自分で直せるように導く。",
+    "- 場所は行番号で示す。専門用語にはひとこと説明を添える。最後にひとことはげます。",
+    "- マークダウンの見出しや太字は使わず、ふつうの文章で書く。",
+    "",
+    "# 実行環境",
+    "- ブラウザの iframe 内で「1つのHTMLページ(CSS/JavaScript込み)」として実行される。",
+    "- AkaDako のセンサーやLED等は <script src=\"akadako.js\"></script> を読み込み、",
+    "  `const board = await AkaDako.connect();` が返す board のメソッドで操作する。",
+    "- fetch〜 と run〜 のメソッドは await を付けて async 関数の中で呼ぶ。",
+    "",
+    "# 使える主なAPI（board のメソッド）",
+    boardApiLines(),
+    "",
+    "# 今のHTMLコード（行番号なし）",
+    "```html",
+    cm.getValue(),
+    "```",
+  ];
+  if (pageErrors.length) {
+    const trimmed = pageErrors.slice(-MAX_PAGE_ERRORS).map((e) => e.slice(0, 300));
+    lines.push("", "# 実行時に出ているエラー", ...trimmed);
+  }
+  const ctx = buildRuntimeContext();
+  if (ctx) lines.push("", "# 実行時の状況", ctx);
+  if (consultHistory.length) {
+    lines.push("", "# これまでのやりとり");
+    for (const h of consultHistory) lines.push("質問: " + h.q, "あなたの回答: " + h.a);
+  }
+  lines.push("", "# 質問", question);
+  if (mode === "askError") {
+    lines.push("（エラーの原因と直し方のヒントを中心に答えてください）");
+  }
+  return lines.join("\n");
+}
+
 // 応答テキストからコード本体を取り出す（マークダウンのコードフェンスがあれば剥がす）。
 function extractCode(text) {
   if (!text) return "";
@@ -775,21 +861,37 @@ async function callGenerativeAI(promptText) {
   return res.json(); // { content: string|null, error?: string|object }
 }
 
-// prefill を渡すと入力欄に復元する（エラー後の「入力に戻る」でのみ使用）。
-// 通常のボタンからの起動は空欄で開き、前回のプロンプトは表示しない。
-function openVibeDialog(prefill) {
+// prefill を渡すと入力欄に復元する（エラー後の「入力に戻る」と「続けて質問」で使用）。
+// presetMode でモードを指定して開ける（コンソール欄の「AIに聞く」導線など）。
+// keepHistory が真のときだけ相談のやりとりを引き継ぐ（既定は新しい相談として開始）。
+function openVibeDialog(prefill, presetMode, keepHistory) {
+  if (!keepHistory) consultHistory = [];
   const wrap = document.createElement("div");
 
-  // モード切り替え（今のコードを修正 / ゼロから作る）。
-  // 初期値は編集状態から自動選択: 未編集(スターター/生成直後)ならゼロから、手を加えていれば修正。
-  let mode = editorPristine ? "new" : "modify";
+  // モード切り替え。初期値は状況から自動選択:
+  // 実行時エラーが出ていればエラー相談、未編集(スターター/生成直後)ならゼロから、それ以外は修正。
+  let mode = presetMode || (pageErrors.length ? "askError" : editorPristine ? "new" : "modify");
+  // 新しい実行でエラーが消えた後に古い「AIに聞く」導線から開かれた等、エラーが
+  // もう無いのにエラー相談を指定されたときはコード相談に切り替える
+  if (mode === "askError" && !pageErrors.length) mode = "askCode";
   const seg = document.createElement("div");
   seg.className = "seg";
-  const btnModify = document.createElement("button");
-  btnModify.textContent = "今のコードを修正";
-  const btnNew = document.createElement("button");
-  btnNew.textContent = "ゼロから作る";
-  seg.append(btnModify, btnNew);
+  const modeBtns = new Map([
+    ["modify", "今のコードを修正"],
+    ["new", "ゼロから作る"],
+    ["askError", "エラー原因について相談"],
+    ["askCode", "コードについて相談"],
+  ].map(([m, text]) => {
+    const b = document.createElement("button");
+    b.textContent = text;
+    b.addEventListener("click", () => { mode = m; renderMode(); ta.focus(); });
+    seg.append(b);
+    return [m, b];
+  }));
+  if (!pageErrors.length) {
+    modeBtns.get("askError").disabled = true;
+    modeBtns.get("askError").title = "実行時にエラーが出たときに使えます";
+  }
 
   const label = document.createElement("div");
   label.style.marginBottom = ".4rem";
@@ -799,55 +901,84 @@ function openVibeDialog(prefill) {
   const hint = document.createElement("div");
   hint.style.cssText = "font-size:.85rem;color:var(--muted);margin-top:.5rem;line-height:1.6;";
 
+  const doSend = () => {
+    const p = ta.value.trim();
+    // エラー相談だけは空欄OK（タイピングせずワンクリックで聞ける）
+    if (!p && mode !== "askError") { ta.focus(); return; }
+    lastVibePrompt = p;
+    if (mode === "modify" || mode === "new") runVibeGeneration(p, mode);
+    else runVibeConsult(p || "なぜこのエラーになったのか教えて", mode);
+  };
+
   function renderMode() {
-    btnModify.classList.toggle("active", mode === "modify");
-    btnNew.classList.toggle("active", mode === "new");
+    for (const [m, b] of modeBtns) b.classList.toggle("active", m === mode);
     if (mode === "modify") {
       label.textContent = "今のコードをどう直したいか、日本語で説明してください:";
-      ta.placeholder = "例: 明るさセンサーの値も大きな文字で表示して";
+      ta.placeholder = pageErrors.length ? "例: エラーを直して" : "例: 明るさセンサーの値も大きな文字で表示して";
       hint.textContent =
         "エディタの現在のコードを送り、要望に沿って修正します。" +
         (pageErrors.length ? "実行時に出ているエラーも一緒に送ります。" : "") +
         "コードが大きいと送信できないことがあります。Ctrl/⌘+Enter でも実行できます。";
-    } else {
+    } else if (mode === "new") {
       label.textContent = "作りたいものを日本語で説明してください:";
       ta.placeholder = "例: 距離センサーの値が近いほど画面が赤くなるページ";
       hint.textContent = "ゼロから新しいHTMLページを作ります（今の内容は置き換わります）。Ctrl/⌘+Enter でも実行できます。";
+    } else if (mode === "askError") {
+      label.textContent = "エラーについて聞きたいことがあれば書いてください（空欄でもOK）:";
+      ta.placeholder = "空欄のまま「質問する」と、エラーの原因と直し方のヒントを聞けます";
+      hint.textContent = "今のコードと実行時に出たエラーをAIに送り、原因と直し方のヒントを教えてもらいます。" +
+        "コードは変更されません。Ctrl/⌘+Enter でも実行できます。";
+    } else {
+      label.textContent = "聞きたいこと・困っていることを日本語で書いてください:";
+      ta.placeholder = "例: ボタンを押しても何も起きない ／ このコードは何をしている？";
+      hint.textContent = "今のコードとセンサーの計測値をAIに送り、アドバイスをもらいます。" +
+        "コードは変更されません。Ctrl/⌘+Enter でも実行できます。";
     }
+    const consulting = mode === "askError" || mode === "askCode";
+    showModal(VIBE_TITLE, wrap, [
+      { label: consulting ? "質問する 💬" : "生成 ✨", primary: true, onClick: doSend },
+      { label: "キャンセル", onClick: closeModal },
+    ]);
   }
-  btnModify.addEventListener("click", () => { mode = "modify"; renderMode(); ta.focus(); });
-  btnNew.addEventListener("click", () => { mode = "new"; renderMode(); ta.focus(); });
+  wrap.append(seg, label, ta, hint);
   renderMode();
 
-  wrap.append(seg, label, ta, hint);
-
-  const doGen = () => {
-    const p = ta.value.trim();
-    if (!p) { ta.focus(); return; }
-    lastVibePrompt = p;
-    runVibeGeneration(p, mode);
-  };
   ta.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); doGen(); }
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); doSend(); }
   });
-  showModal("バイブコーディング ✨", wrap, [
-    { label: "生成 ✨", primary: true, onClick: doGen },
-    { label: "キャンセル", onClick: closeModal },
-  ]);
   setTimeout(() => ta.focus(), 0);
 }
 
-async function runVibeGeneration(promptText, mode) {
-  const currentCode = mode === "modify" ? cm.getValue() : null;
-  const errors = mode === "modify" ? pageErrors.slice() : [];   // 実行時エラーのスナップショット
+function showVibeSpinner(message) {
   const node = document.createElement("div");
   node.style.cssText = "display:flex;align-items:center;gap:.7rem;";
   const spin = document.createElement("span");
   spin.className = "vibe-spinner";
   const txt = document.createElement("span");
-  txt.textContent = "生成中です…（10〜30秒ほどかかります）";
+  txt.textContent = message;
   node.append(spin, txt);
-  showModal("バイブコーディング ✨", node, []); // 生成中はボタンなし
+  showModal(VIBE_TITLE, node, []); // 応答待ちの間はボタンなし
+}
+
+// 応答のエラーを表示用に取り出す（xcx-g2s の生成AIブロックと同じ分岐）。
+function parseAIError(data, emptyMessage) {
+  let errHtml = null, errText = null;
+  if (data && data.error) {
+    if (typeof data.error === "string") {
+      errText = data.error;
+    } else if (typeof data.error === "object") {
+      if (data.error.type === "text/html") errHtml = data.error.content;
+      else if (typeof data.error.content === "string") errText = data.error.content;
+    }
+  }
+  if (!errHtml && !errText) errText = emptyMessage;
+  return { errHtml, errText };
+}
+
+async function runVibeGeneration(promptText, mode) {
+  const currentCode = mode === "modify" ? cm.getValue() : null;
+  const errors = mode === "modify" ? pageErrors.slice() : [];   // 実行時エラーのスナップショット
+  showVibeSpinner("生成中です…（10〜30秒ほどかかります）");
 
   try {
     const data = await callGenerativeAI(buildVibePrompt(promptText, currentCode, errors));
@@ -857,33 +988,61 @@ async function runVibeGeneration(promptText, mode) {
       applyVibeResult(code, mode);
       return;
     }
-    // エラー処理（xcx-g2s の生成AIブロックと同じ分岐）
-    let errHtml = null, errText = null;
-    if (data && data.error) {
-      if (typeof data.error === "string") {
-        errText = data.error;
-      } else if (typeof data.error === "object") {
-        if (data.error.type === "text/html") errHtml = data.error.content;
-        else if (typeof data.error.content === "string") errText = data.error.content;
-      }
-    }
-    if (!errHtml && !errText) {
-      errText = "空の応答が返りました。要望を具体的にして、もう一度お試しください。";
-    }
-    showVibeError(errHtml, errText);
+    const { errHtml, errText } = parseAIError(data, "空の応答が返りました。要望を具体的にして、もう一度お試しください。");
+    showVibeError(errHtml, errText, mode);
   } catch (e) {
-    showVibeError(null, "生成AIに接続できませんでした: " + ((e && e.message) || e));
+    showVibeError(null, "生成AIに接続できませんでした: " + ((e && e.message) || e), mode);
   }
 }
 
-function showVibeError(html, text) {
+// 相談モード: コードは変更せず、原因の説明と直し方のヒントをもらってダイアログに表示する。
+async function runVibeConsult(question, mode) {
+  showVibeSpinner("考え中です…（10〜30秒ほどかかります）");
+  try {
+    const data = await callGenerativeAI(buildConsultPrompt(question, mode));
+    if (data && typeof data.content === "string" && data.content.trim() !== "") {
+      const answer = data.content.trim();
+      consultHistory.push({ q: question, a: answer });
+      if (consultHistory.length > 3) consultHistory.shift();   // プロンプトの肥大化を防ぐ
+      showConsultAnswer(question, answer, mode);
+      return;
+    }
+    const { errHtml, errText } = parseAIError(data, "空の応答が返りました。質問を具体的にして、もう一度お試しください。");
+    showVibeError(errHtml, errText, mode);
+  } catch (e) {
+    showVibeError(null, "生成AIに接続できませんでした: " + ((e && e.message) || e), mode);
+  }
+}
+
+function showConsultAnswer(question, answer, mode) {
+  const wrap = document.createElement("div");
+  const q = document.createElement("div");
+  q.className = "consult-q";
+  q.textContent = "Q. " + question;
+  const a = document.createElement("div");
+  a.className = "consult-a";
+  a.textContent = answer;
+  wrap.append(q, a);
+  showModal(VIBE_TITLE, wrap, [
+    {
+      label: "このまま直してもらう ✨", primary: true, onClick: () => {
+        // アドバイスの内容を修正指示として引き継ぎ、修正モードで生成する
+        runVibeGeneration("次の相談とアドバイスの内容にそって直してください。\n[相談] " + question + "\n[アドバイス] " + answer, "modify");
+      },
+    },
+    { label: "続けて質問", onClick: () => openVibeDialog("", mode, true) },
+    { label: "閉じる", onClick: closeModal },
+  ]);
+}
+
+function showVibeError(html, text, mode) {
   const node = document.createElement("div");
   node.className = "vibe-errbox";
   if (html) node.innerHTML = html;          // 699.jp のエラー（アクセスコード案内リンク等）
   else node.textContent = text || "生成に失敗しました。";
-  showModal("バイブコーディング ✨", node, [
+  showModal(VIBE_TITLE, node, [
     // エラー時だけは、打ち直さずに済むよう直前の入力を復元する
-    { label: "入力に戻る", primary: true, onClick: () => openVibeDialog(lastVibePrompt) },
+    { label: "入力に戻る", primary: true, onClick: () => openVibeDialog(lastVibePrompt, mode, true) },
     { label: "閉じる", onClick: closeModal },
   ]);
 }
@@ -913,6 +1072,17 @@ function applyVibeResult(code, mode) {
 }
 
 $("vibe").addEventListener("click", () => openVibeDialog());   // 空欄で開く（前回のプロンプトは表示しない）
+
+// 実行中のページで最初のエラーが出たとき、コンソール欄のエラーの下に
+// 「AIに聞く」導線を出す（押すとエラー相談モードでダイアログが開く）。
+function offerErrorConsult() {
+  const b = document.createElement("button");
+  b.className = "ask-ai";
+  b.textContent = "🤔 エラーの意味をAIに聞いてみる";
+  b.addEventListener("click", () => openVibeDialog(undefined, "askError"));
+  consoleEl.append(b, document.createTextNode("\n"));
+  consoleEl.scrollTop = consoleEl.scrollHeight;
+}
 
 // --- 右パネルのタブ（センサー / リファレンス） -------------------------------------
 const refview = $("refview");
